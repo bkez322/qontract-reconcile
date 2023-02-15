@@ -1,0 +1,14 @@
+mypy
+types-click
+types-croniter
+types-Jinja2
+types-mock
+types-pyOpenSSL
+types-python-dateutil
+types-PyYAML
+types-requests
+types-setuptools
+types-tabulate
+types-toml
+boto3-stubs[ec2,s3,rds,iam,route53]==1.24.29
+qenerate==0.4.5

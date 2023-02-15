@@ -1,9 +1,12 @@
-.PHONY: build push rc build-test test clean
+.PHONY: help build push rc build-test test-app test-container-image test clean
 
+CONTAINER_ENGINE ?= $(shell which podman >/dev/null 2>&1 && echo podman || echo docker)
+CONTAINER_UID ?= $(shell id -u)
 IMAGE_TEST := reconcile-test
 
 IMAGE_NAME := quay.io/app-sre/qontract-reconcile
 IMAGE_TAG := $(shell git rev-parse --short=7 HEAD)
+VENV_CMD := . venv/bin/activate &&
 
 ifneq (,$(wildcard $(CURDIR)/.docker))
 	DOCKER_CONF := $(CURDIR)/.docker
@@ -11,30 +14,91 @@ else
 	DOCKER_CONF := $(HOME)/.docker
 endif
 
-build:
-	@docker build -t $(IMAGE_NAME):latest -f dockerfiles/Dockerfile .
-	@docker tag $(IMAGE_NAME):latest $(IMAGE_NAME):$(IMAGE_TAG)
+CTR_STRUCTURE_IMG := quay.io/app-sre/container-structure-test:latest
+
+help: ## Prints help for targets with comments
+	@grep -E '^[a-zA-Z0-9.\ _-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
+
+# this will write a GIT_VERSION file in the current dir, which allows to get the info from a non-git-repo folder, like during docker build
+git_version:
+	rm -f GIT_VERSION
+	python3 --version
+	./version --git
+
+build: git_version
+	@DOCKER_BUILDKIT=1 $(CONTAINER_ENGINE) build -t $(IMAGE_NAME):latest -f dockerfiles/Dockerfile --target prod-image . --progress=plain
+	@$(CONTAINER_ENGINE) tag $(IMAGE_NAME):latest $(IMAGE_NAME):$(IMAGE_TAG)
+
+build-dev: git_version
+	@DOCKER_BUILDKIT=1 $(CONTAINER_ENGINE) build --build-arg CONTAINER_UID=$(CONTAINER_UID) -t $(IMAGE_NAME)-dev:latest -f dockerfiles/Dockerfile --target dev-image .
 
 push:
-	@docker --config=$(DOCKER_CONF) push $(IMAGE_NAME):latest
-	@docker --config=$(DOCKER_CONF) push $(IMAGE_NAME):$(IMAGE_TAG)
+	@$(CONTAINER_ENGINE) --config=$(DOCKER_CONF) push $(IMAGE_NAME):latest
+	@$(CONTAINER_ENGINE) --config=$(DOCKER_CONF) push $(IMAGE_NAME):$(IMAGE_TAG)
 
-rc:
-	@docker build -t $(IMAGE_NAME):$(IMAGE_TAG)-rc -f dockerfiles/Dockerfile .
-	@docker --config=$(DOCKER_CONF) push $(IMAGE_NAME):$(IMAGE_TAG)-rc
+rc: git_version
+	@$(CONTAINER_ENGINE) build -t $(IMAGE_NAME):$(IMAGE_TAG)-rc -f dockerfiles/Dockerfile --target prod-image .
+	@$(CONTAINER_ENGINE) --config=$(DOCKER_CONF) push $(IMAGE_NAME):$(IMAGE_TAG)-rc
 
 generate:
 	@helm lint helm/qontract-reconcile
-	@helm template helm/qontract-reconcile -n qontract-reconcile -f helm/qontract-reconcile/values-external.yaml > openshift/qontract-reconcile.yaml
-	@helm template helm/qontract-reconcile -n qontract-reconcile -f helm/qontract-reconcile/values-internal.yaml > openshift/qontract-reconcile-internal.yaml
+	@helm template helm/qontract-reconcile -n qontract-reconcile -f helm/qontract-reconcile/values-manager.yaml > openshift/qontract-manager.yaml
+	@helm template helm/qontract-reconcile -n qontract-reconcile -f helm/qontract-reconcile/values-manager-fedramp.yaml > openshift/qontract-manager-fedramp.yaml
 
 build-test:
-	@docker build -t $(IMAGE_TEST) -f dockerfiles/Dockerfile.test .
+	@$(CONTAINER_ENGINE) build -t $(IMAGE_TEST) -f dockerfiles/Dockerfile.test .
 
-test: build-test
-	@docker run --rm $(IMAGE_TEST)
+test-app: build-test ## Target to test app with tox on docker
+	@$(CONTAINER_ENGINE) run --rm $(IMAGE_TEST)
+
+test-container-image: build ## Target to test the final image
+	@$(CONTAINER_ENGINE) run --rm \
+		-v /var/run/docker.sock:/var/run/docker.sock \
+		-v $(CURDIR):/work \
+		 $(CTR_STRUCTURE_IMG) test \
+		--config /work/dockerfiles/structure-test.yaml \
+		-i $(IMAGE_NAME):$(IMAGE_TAG)
+
+test: test-app test-container-image
+
+dev-reconcile-loop: build-dev ## Trigger the reconcile loop inside a container for an integration
+	@$(CONTAINER_ENGINE) run --rm -it \
+		--add-host=host.docker.internal:host-gateway \
+		-v $(CURDIR):/work \
+		-p 5678:5678 \
+		-e INTEGRATION_NAME=$(INTEGRATION_NAME) \
+		-e INTEGRATION_EXTRA_ARGS=$(INTEGRATION_EXTRA_ARGS) \
+		-e SLEEP_DURATION_SECS=$(SLEEP_DURATION_SECS) \
+		-e DRY_RUN=$(DRY_RUN) \
+		-e DEBUGGER=$(DEBUGGER) \
+		-e CONFIG=/work/config.dev.toml \
+		$(IMAGE_NAME)-dev:latest
 
 clean:
-	@rm -rf .tox .eggs reconcile.egg-info build .pytest_cache
+	@rm -rf .tox .eggs reconcile.egg-info build .pytest_cache venv GIT_VERSION
 	@find . -name "__pycache__" -type d -print0 | xargs -0 rm -rf
 	@find . -name "*.pyc" -delete
+
+dev-venv: clean ## Create a local venv for your IDE and remote debugging
+	python3.9 -m venv venv
+	@$(VENV_CMD) pip install --upgrade pip
+	@$(VENV_CMD) pip install -e .
+	@$(VENV_CMD) pip install -r requirements/requirements-dev.txt
+
+print-files-modified-in-last-30-days:
+	@git log --since '$(shell date --date='-30 day' +"%m/%d/%y")' --until '$(shell date +"%m/%d/%y")' --oneline --name-only --pretty=format: | sort | uniq | grep -E '.py$$'
+
+format:
+	@$(VENV_CMD) isort reconcile tools release e2e_tests dockerfiles/hack setup.py
+	@$(VENV_CMD) black reconcile/ tools/ e2e_tests/
+
+gql-introspection:
+	# TODO: make url configurable
+	@$(VENV_CMD) qenerate introspection http://localhost:4000/graphql > reconcile/gql_definitions/introspection.json
+
+gql-query-classes:
+	@$(VENV_CMD) qenerate code -i reconcile/gql_definitions/introspection.json reconcile/gql_definitions
+	find reconcile/gql_definitions -path '*/__pycache__' -prune -o -type d -exec touch "{}/__init__.py" \;
+	@$(VENV_CMD) black reconcile/gql_definitions
+
+qenerate: gql-introspection gql-query-classes

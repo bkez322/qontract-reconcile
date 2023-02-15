@@ -1,9 +1,50 @@
-import os
 import json
+import os
+from collections.abc import (
+    Iterable,
+    Mapping,
+)
+from typing import (
+    Any,
+    Optional,
+)
 
 from botocore.errorfactory import ClientError
+from jinja2 import Template
 
+from reconcile.utils import gql
 from reconcile.utils.aws_api import AWSApi
+from reconcile.utils.secret_reader import SecretReaderBase
+
+
+class StateInaccessibleException(Exception):
+    pass
+
+
+STATE_ACCOUNT_QUERY = """
+{
+  accounts: awsaccounts_v1 (name: "{{ name }}")
+  {
+    name
+    resourcesDefaultRegion
+    automationToken {
+      path
+      field
+      version
+      format
+    }
+  }
+}
+"""
+
+
+def init_state(integration: str, secret_reader: SecretReaderBase):
+    state_bucket_account_name = os.environ["APP_INTERFACE_STATE_BUCKET_ACCOUNT"]
+    query = Template(STATE_ACCOUNT_QUERY).render(name=state_bucket_account_name)
+    accounts = gql.get_api().query(query)["accounts"]
+    return State(
+        integration=integration, accounts=accounts, secret_reader=secret_reader
+    )
 
 
 class State:
@@ -19,20 +60,40 @@ class State:
     :param accounts: Graphql AWS accounts query results
     :param settings: App Interface settings
 
-    :type integration: string
-    :type accounts: list
-    :type settings: dict
+    :raises StateInaccessibleException: if the bucket is missing
+    or not accessible
     """
-    def __init__(self, integration, accounts, settings=None):
+
+    def __init__(
+        self,
+        integration: str,
+        accounts: Iterable[Mapping[str, Any]],
+        settings: Optional[Mapping[str, Any]] = None,
+        secret_reader: Optional[SecretReaderBase] = None,
+    ) -> None:
         """Initiates S3 client from AWSApi."""
-        self.state_path = f"state/{integration}"
-        self.bucket = os.environ['APP_INTERFACE_STATE_BUCKET']
-        account = os.environ['APP_INTERFACE_STATE_BUCKET_ACCOUNT']
-        accounts = [a for a in accounts if a['name'] == account]
-        aws_api = AWSApi(1, accounts, settings=settings)
+        self.state_path = f"state/{integration}" if integration else "state"
+        self.bucket = os.environ["APP_INTERFACE_STATE_BUCKET"]
+        account = os.environ["APP_INTERFACE_STATE_BUCKET_ACCOUNT"]
+        accounts = [a for a in accounts if a["name"] == account]
+        aws_api = AWSApi(
+            1,
+            accounts,
+            settings=settings,
+            secret_reader=secret_reader,
+            init_users=False,
+        )
         session = aws_api.get_session(account)
 
-        self.client = session.client('s3')
+        self.client = session.client("s3")
+
+        # check if the bucket exists
+        try:
+            self.client.head_bucket(Bucket=self.bucket)
+        except ClientError as details:
+            raise StateInaccessibleException(
+                f"Bucket {self.bucket} is not accessible - {str(details)}"
+            )
 
     def exists(self, key):
         """
@@ -41,26 +102,47 @@ class State:
         :param key: key to check
 
         :type key: string
+
+        :raises StateInaccessibleException: if the bucket is missing or
+        permissions are insufficient or a general AWS error occurred
         """
+        key_path = f"{self.state_path}/{key}"
         try:
-            self.client.head_object(
-                Bucket=self.bucket, Key=f"{self.state_path}/{key}")
+            self.client.head_object(Bucket=self.bucket, Key=key_path)
             return True
-        except ClientError:
-            return False
+        except ClientError as details:
+            error_code = details.response.get("Error", {}).get("Code", None)
+            if error_code == "404":
+                return False
+            else:
+                raise StateInaccessibleException(
+                    f"Can not access state key {key_path} "
+                    f"in bucket {self.bucket} - {str(details)}"
+                )
 
     def ls(self):
         """
         Returns a list of keys in the state
         """
-        objects = self.client.list_objects(Bucket=self.bucket,
-                                           Prefix=self.state_path)
+        objects = self.client.list_objects_v2(
+            Bucket=self.bucket, Prefix=f"{self.state_path}/"
+        )
 
-        if 'Contents' not in objects:
+        if "Contents" not in objects:
             return []
 
-        return [o['Key'].replace(self.state_path, '')
-                for o in objects['Contents']]
+        contents = objects["Contents"]
+
+        while objects["IsTruncated"]:
+            objects = self.client.list_objects_v2(
+                Bucket=self.bucket,
+                Prefix=f"{self.state_path}/",
+                ContinuationToken=objects["NextContinuationToken"],
+            )
+
+            contents += objects["Contents"]
+
+        return [c["Key"].replace(self.state_path, "") for c in contents]
 
     def add(self, key, value=None, force=False):
         """
@@ -72,8 +154,7 @@ class State:
         :type key: string
         """
         if self.exists(key) and not force:
-            raise KeyError(f"[state] key {key} already "
-                           f"exists in {self.state_path}")
+            raise KeyError(f"[state] key {key} already " f"exists in {self.state_path}")
         self[key] = value
 
     def rm(self, key):
@@ -85,10 +166,8 @@ class State:
         :type key: string
         """
         if not self.exists(key):
-            raise KeyError(
-                f"[state] key {key} does not exists in {self.state_path}")
-        self.client.delete_object(
-            Bucket=self.bucket, Key=f"{self.state_path}/{key}")
+            raise KeyError(f"[state] key {key} does not exists in {self.state_path}")
+        self.client.delete_object(Bucket=self.bucket, Key=f"{self.state_path}/{key}")
 
     def get(self, key, *args):
         """
@@ -112,22 +191,26 @@ class State:
         """
         Gets all keys and values from the state in the specified path.
         """
-        return {k.replace(f'/{path}/', ''): self.get(k.lstrip('/'))
-                for k in self.ls() if k.startswith(f'/{path}')}
+        return {
+            k.replace(f"{path}/", "").strip("/"): self.get(k.lstrip("/"))
+            for k in self.ls()
+            if k.startswith(f"/{path}")
+        }
 
     def __getitem__(self, item):
         try:
-            response = self.client.get_object(Bucket=self.bucket,
-                                              Key=f"{self.state_path}/{item}")
-            return json.loads(response['Body'].read())
+            response = self.client.get_object(
+                Bucket=self.bucket, Key=f"{self.state_path}/{item}"
+            )
+            return json.loads(response["Body"].read())
         except ClientError as details:
-            if details.response['Error']['Code'] == 'NoSuchKey':
+            if details.response["Error"]["Code"] == "NoSuchKey":
                 raise KeyError(item)
             raise
         except json.decoder.JSONDecodeError:
             raise KeyError(item)
 
     def __setitem__(self, key, value):
-        self.client.put_object(Bucket=self.bucket,
-                               Key=f"{self.state_path}/{key}",
-                               Body=json.dumps(value))
+        self.client.put_object(
+            Bucket=self.bucket, Key=f"{self.state_path}/{key}", Body=json.dumps(value)
+        )

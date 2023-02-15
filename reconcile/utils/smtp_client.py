@@ -1,93 +1,92 @@
-import imaplib
 import smtplib
-
+from collections.abc import Iterable
+from email.header import Header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.header import Header
 from email.utils import formataddr
+from typing import Optional
+
+from pydantic import (
+    BaseModel,
+    Field,
+)
 from sretoolbox.utils import retry
 
-from reconcile.utils.secret_reader import SecretReader
-from reconcile.utils.config import get_config
+from reconcile.utils.secret_reader import (
+    HasSecret,
+    SecretReaderBase,
+)
+
+DEFAULT_SMTP_TIMEOUT = 30
+
+
+class SmtpServerConnectionInfo(BaseModel):
+    host: str = Field(..., alias="server")
+    port: int
+    username: str
+    password: str
+    # require_tls: bool - currently not in use
+
+
+def get_smtp_server_connection(
+    secret_reader: SecretReaderBase, secret: HasSecret
+) -> SmtpServerConnectionInfo:
+    """Retrieve SMTP credentials from config or vault.
+
+    Args:
+    - secret_reader: a SecretReader instance
+    - secret: a 'secret' class instance which implements the HasSecret protocol. E.g. VaultSecret (reconcile.gql_definitions.common.smtp_client_settings.SmtpSettingsV1.credentials)
+    """
+    data = secret_reader.read_all_secret(secret)
+    return SmtpServerConnectionInfo(**data)
 
 
 class SmtpClient:
-    def __init__(self, settings):
-        config = get_config()
-
-        smtp_secret_path = config['smtp']['secret_path']
-        smtp_config = self.get_smtp_config(smtp_secret_path, settings)
-        self.host = smtp_config['server']
-        self.port = str(smtp_config['port'])
-        self.user = smtp_config['username']
-        self.passwd = smtp_config['password']
-        self.mail_address = config['smtp']['mail_address']
-
-        self._client = None
-        self._server = None
+    def __init__(
+        self,
+        server: SmtpServerConnectionInfo,
+        mail_address: str,
+        timeout: int = DEFAULT_SMTP_TIMEOUT,
+    ) -> None:
+        self.host = server.host
+        self.port = server.port
+        self.user = server.username
+        self.passwd = server.password
+        self.mail_address = mail_address
+        self.timeout = timeout
+        self._client: Optional[smtplib.SMTP] = None
 
     @property
-    def client(self):
+    def client(self) -> smtplib.SMTP:
         if self._client is None:
-            self._client = smtplib.SMTP(host=self.host, port=self.port)
+            self._client = smtplib.SMTP(
+                host=self.host, port=self.port, timeout=self.timeout
+            )
             self._client.send
             self._client.starttls()
             self._client.login(self.user, self.passwd)
         return self._client
 
-    @property
-    def server(self):
-        if self._server is None:
-            self._server = imaplib.IMAP4_SSL(host=self.host)
-            self._server.login(self.user, self.passwd)
-        return self._server
-
-    @staticmethod
-    def get_smtp_config(path, settings):
-        config = {}
-        required_keys = ('password', 'port', 'require_tls', 'server',
-                         'username')
-        secret_reader = SecretReader(settings=settings)
-        data = secret_reader.read_all({'path': path})
-        try:
-            for k in required_keys:
-                config[k] = data[k]
-        except KeyError as e:
-            raise Exception(f'Missing expected SMTP config '
-                            f'key in vault secret: {e}')
-        return config
-
-    def get_mails(self, folder='INBOX', criteria='ALL'):
-        self.server.select(f'"{folder}"')
-        _, data = self.server.uid('search', None, criteria)
-        uids = [s for s in data[0].split()]
-        results = []
-        for uid in uids:
-            _, data = self.server.uid('fetch', uid, '(RFC822)')
-            msg = data[0][1].decode('utf-8')
-            results.append({'uid': uid, 'msg': msg})
-        return results
-
-    def send_mails(self, mails):
+    def send_mails(self, mails: Iterable[tuple[str, str, str]]) -> None:
         for name, subject, body in mails:
             self.send_mail([name], subject, body)
 
     @retry()
-    def send_mail(self, names, subject, body):
+    def send_mail(self, names: str, subject: str, body: str) -> None:
         msg = MIMEMultipart()
-        from_name = str(Header('App SRE team automation', 'utf-8'))
-        msg['From'] = formataddr((from_name, self.user))
+        from_name = str(Header("App SRE team automation", "utf-8"))
+        msg["From"] = formataddr((from_name, self.user))
         to = set()
         for name in names:
-            if '@' in name:
+            if "@" in name:
                 to.add(name)
             else:
                 to.add(f"{name}@{self.mail_address}")
-        msg['To'] = ', '.join(to)
-        msg['Subject'] = subject
+        msg["To"] = ", ".join(to)
+        msg["Subject"] = subject
         # add in the message body
-        msg.attach(MIMEText(body, 'plain'))
-        self.client.sendmail(self.user, to, msg.as_string())
+        msg.attach(MIMEText(body, "plain"))
+        self.client.sendmail(self.user, list(to), msg.as_string())
 
-    def get_recipient(self, org_username):
-        return f'{org_username}@{self.mail_address}'
+    def get_recipient(self, org_username: str) -> str:
+        return f"{org_username}@{self.mail_address}"

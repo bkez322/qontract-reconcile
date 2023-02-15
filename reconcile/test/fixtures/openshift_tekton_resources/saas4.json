@@ -1,0 +1,9 @@
+{
+  "path": "saas4.yaml",
+  "name": "saas4",
+  "pipelinesProvider": {
+    "name": "provider4-with-task-duplicates",
+    "provider": "tekton"
+  },
+  "deployResources": null
+}

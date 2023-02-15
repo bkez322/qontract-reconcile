@@ -1,0 +1,42 @@
+# qenerate: plugin=pydantic_v1
+
+query ChangeTypes($name: String) {
+  change_types: change_types_v1(name: $name) {
+    name
+    description
+    priority
+    contextType
+    contextSchema
+    disabled
+    changes {
+      provider
+      changeSchema
+      ... on ChangeTypeChangeDetectorJsonPathProvider_v1 {
+        jsonPathSelectors
+        context {
+          selector
+          when
+        }
+      }
+      ... on ChangeTypeChangeDetectorChangeTypeProvider_v1 {
+        changeTypes {
+          name
+          contextSchema
+        }
+        ownership_context: context {
+          selector
+          when
+        }
+      }
+    }
+    implicitOwnership {
+      provider
+      ... on ChangeTypeImplicitOwnershipJsonPathProvider_v1 {
+        jsonPathSelector
+      }
+    }
+    inherit {
+      name
+    }
+  }
+}

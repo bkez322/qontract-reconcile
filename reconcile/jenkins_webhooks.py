@@ -1,18 +1,22 @@
 import copy
 import logging
+from typing import Any
 
-import reconcile.queries as queries
-
+from reconcile import queries
+from reconcile.jenkins_job_builder import (
+    get_jenkins_configs,
+    init_jjb,
+)
 from reconcile.utils.gitlab_api import GitLabApi
-from reconcile.jenkins_job_builder import init_jjb
+from reconcile.utils.jjb_client import JJB
+from reconcile.utils.secret_reader import SecretReader
 
-QONTRACT_INTEGRATION = 'jenkins-webhooks'
+QONTRACT_INTEGRATION = "jenkins-webhooks"
 
 
-def get_gitlab_api():
+def get_gitlab_api(secret_reader: SecretReader) -> GitLabApi:
     instance = queries.get_gitlab_instance()
-    settings = queries.get_app_interface_settings()
-    return GitLabApi(instance, settings=settings)
+    return GitLabApi(instance, secret_reader=secret_reader)
 
 
 def get_hooks_to_add(desired_state, gl):
@@ -22,31 +26,37 @@ def get_hooks_to_add(desired_state, gl):
             current_hooks = gl.get_project_hooks(project_url)
             for h in current_hooks:
                 job_url = h.url
-                trigger = 'mr' if h.merge_requests_events else 'push'
+                trigger = "mr" if h.merge_requests_events else "push"
                 item = {
-                    'job_url': job_url.strip('/'),
-                    'trigger': trigger,
+                    "job_url": job_url.strip("/"),
+                    "trigger": trigger,
                 }
                 if item in desired_hooks:
                     desired_hooks.remove(item)
         except Exception:
-            logging.warning('no access to project: ' + project_url)
+            logging.warning("no access to project: " + project_url)
             diff[project_url] = []
 
     return diff
 
 
 def run(dry_run):
-    jjb, _ = init_jjb()
-    gl = get_gitlab_api()
+    secret_reader = SecretReader(queries.get_secret_reader_settings())
+    jjb: JJB = init_jjb(secret_reader)
+    gl = get_gitlab_api(secret_reader)
 
     desired_state = jjb.get_job_webhooks_data()
     diff = get_hooks_to_add(desired_state, gl)
 
     for project_url, hooks in diff.items():
         for h in hooks:
-            logging.info(['create_hook', project_url,
-                          h['trigger'], h['job_url']])
+            logging.info(["create_hook", project_url, h["trigger"], h["job_url"]])
 
             if not dry_run:
                 gl.create_project_hook(project_url, h)
+
+
+def early_exit_desired_state(*args, **kwargs) -> dict[str, Any]:
+    return {
+        "jenkins_configs": get_jenkins_configs(),
+    }

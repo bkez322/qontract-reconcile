@@ -1,0 +1,25 @@
+excludeService: true
+integrations:
+- name: integrations-manager
+  resources:
+    requests:
+      memory: 300Mi
+      cpu: 200m
+    limits:
+      memory: 600Mi
+      cpu: 400m
+  fluentdResources:
+    requests:
+      memory: 60Mi
+      cpu: 15m
+    limits:
+      memory: 240Mi
+      cpu: 25m
+  environmentAware: true
+  logs:
+    slack: false
+    googleChat: true
+  disableUnleash: true
+  shard_specs:
+  - shard_id: 0
+    shards: 1

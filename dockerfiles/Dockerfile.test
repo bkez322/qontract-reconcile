@@ -1,19 +1,12 @@
-FROM quay.io/centos/centos:7
+FROM quay.io/app-sre/qontract-reconcile-builder:0.3.8
 
-ENV LC_ALL=en_US.utf8
-ENV LANG=en_US.utf8
+ENV TOX_PARALLEL_NO_SPINNER=1
 
-RUN yum install -y epel-release && \
-    yum install -y python36 python36-pip git make gcc gcc-c++ python36-devel && \
+WORKDIR /package
+COPY . /package
+
+RUN microdnf upgrade -y && \
     python3 -m pip install --upgrade pip && \
     python3 -m pip install tox
 
-RUN curl -L https://get.helm.sh/helm-v3.6.2-linux-amd64.tar.gz |tar xvz && \
-    mv linux-amd64/helm /usr/local/bin/helm && \
-    chmod +x /usr/local/bin/helm && \
-    rm -rf linux-amd64
-
-COPY . /package
-WORKDIR /package
-
-CMD [ "tox" ]
+CMD ["tox","-p"]

@@ -1,38 +1,43 @@
 import sys
 
-import reconcile.utils.gql as gql
 import reconcile.openshift_base as ob
-import reconcile.queries as queries
-
-from reconcile.utils.semver_helper import make_semver
-from reconcile.utils.openshift_resource import (OpenshiftResource as OR,
-                                                ResourceKeyExistsError)
+from reconcile import queries
+from reconcile.utils import (
+    expiration,
+    gql,
+)
 from reconcile.utils.defer import defer
-
+from reconcile.utils.openshift_resource import OpenshiftResource as OR
+from reconcile.utils.openshift_resource import ResourceKeyExistsError
+from reconcile.utils.semver_helper import make_semver
 
 ROLES_QUERY = """
 {
   roles: roles_v1 {
     name
     users {
+      org_username
       github_username
     }
     bots {
-      github_username
       openshift_serviceaccount
     }
     access {
       cluster {
         name
+        auth {
+          service
+        }
       }
       clusterRole
     }
+    expirationDate
   }
 }
 """
 
 
-QONTRACT_INTEGRATION = 'openshift-clusterrolebindings'
+QONTRACT_INTEGRATION = "openshift-clusterrolebindings"
 QONTRACT_INTEGRATION_VERSION = make_semver(0, 1, 0)
 
 
@@ -42,20 +47,16 @@ def construct_user_oc_resource(role, user):
     body = {
         "apiVersion": "rbac.authorization.k8s.io/v1",
         "kind": "ClusterRoleBinding",
-        "metadata": {
-            "name": name
-        },
-        "roleRef": {
-            "name": role,
-            "kind": "ClusterRole"
-        },
-        "subjects": [
-            {"kind": "User",
-             "name": user}
-        ]
+        "metadata": {"name": name},
+        "roleRef": {"name": role, "kind": "ClusterRole"},
+        "subjects": [{"kind": "User", "name": user}],
     }
-    return OR(body, QONTRACT_INTEGRATION, QONTRACT_INTEGRATION_VERSION,
-              error_details=name), name
+    return (
+        OR(
+            body, QONTRACT_INTEGRATION, QONTRACT_INTEGRATION_VERSION, error_details=name
+        ),
+        name,
+    )
 
 
 def construct_sa_oc_resource(role, namespace, sa_name):
@@ -64,92 +65,86 @@ def construct_sa_oc_resource(role, namespace, sa_name):
     body = {
         "apiVersion": "rbac.authorization.k8s.io/v1",
         "kind": "ClusterRoleBinding",
-        "metadata": {
-            "name": name
-        },
-        "roleRef": {
-            "name": role,
-            "kind": "ClusterRole"
-        },
+        "metadata": {"name": name},
+        "roleRef": {"name": role, "kind": "ClusterRole"},
         "subjects": [
-            {"kind": "ServiceAccount",
-             "name": sa_name,
-             "namespace": namespace}
+            {"kind": "ServiceAccount", "name": sa_name, "namespace": namespace}
         ],
-        "userNames": [
-            f"system:serviceaccount:{namespace}:{sa_name}"
-        ]
+        "userNames": [f"system:serviceaccount:{namespace}:{sa_name}"],
     }
-    return OR(body, QONTRACT_INTEGRATION, QONTRACT_INTEGRATION_VERSION,
-              error_details=name), name
+    return (
+        OR(
+            body, QONTRACT_INTEGRATION, QONTRACT_INTEGRATION_VERSION, error_details=name
+        ),
+        name,
+    )
 
 
 def fetch_desired_state(ri, oc_map):
     gqlapi = gql.get_api()
-    roles = gqlapi.query(ROLES_QUERY)['roles']
+    roles: list[dict] = expiration.filter(gqlapi.query(ROLES_QUERY)["roles"])
     users_desired_state = []
     # set namespace to something indicative
-    namepsace = 'cluster'
+    namespace_cluster_scope = "cluster"
     for role in roles:
-        permissions = [{'cluster': a['cluster']['name'],
-                        'cluster_role': a['clusterRole']}
-                       for a in role['access'] or []
-                       if None not in [a['cluster'], a['clusterRole']]]
+        permissions = [
+            {"cluster": a["cluster"], "cluster_role": a["clusterRole"]}
+            for a in role["access"] or []
+            if None not in [a["cluster"], a["clusterRole"]]
+        ]
         if not permissions:
             continue
 
-        users = [user['github_username']
-                 for user in role['users']]
-        bot_users = [bot['github_username']
-                     for bot in role['bots']
-                     if bot.get('github_username')]
-        users.extend(bot_users)
-        service_accounts = [bot['openshift_serviceaccount']
-                            for bot in role['bots']
-                            if bot.get('openshift_serviceaccount')]
+        service_accounts = [
+            bot["openshift_serviceaccount"]
+            for bot in role["bots"]
+            if bot.get("openshift_serviceaccount")
+        ]
 
         for permission in permissions:
-            cluster = permission['cluster']
+            cluster_info = permission["cluster"]
+            cluster = cluster_info["name"]
             if not oc_map.get(cluster):
                 continue
-            for user in users:
-                # used by openshift-users and github integrations
-                # this is just to simplify things a bit on the their side
-                users_desired_state.append({
-                    'cluster': cluster,
-                    'user': user
-                })
-                if ri is None:
-                    continue
-                oc_resource, resource_name = \
-                    construct_user_oc_resource(
-                        permission['cluster_role'], user)
-                try:
-                    ri.add_desired(
-                        cluster,
-                        namepsace,
-                        'ClusterRoleBinding',
-                        resource_name,
-                        oc_resource
+
+            # get username keys based on used IDPs
+            user_keys = ob.determine_user_keys_for_access(cluster, cluster_info["auth"])
+            for user in role["users"]:
+                for username in {user[user_key] for user_key in user_keys}:
+                    # used by openshift-users and github integrations
+                    # this is just to simplify things a bit on the their side
+                    users_desired_state.append({"cluster": cluster, "user": username})
+                    if ri is None:
+                        continue
+                    oc_resource, resource_name = construct_user_oc_resource(
+                        permission["cluster_role"], username
                     )
-                except ResourceKeyExistsError:
-                    # a user may have a Role assigned to them
-                    # from multiple app-interface roles
-                    pass
+                    try:
+                        ri.add_desired(
+                            cluster,
+                            namespace_cluster_scope,
+                            "ClusterRoleBinding",
+                            resource_name,
+                            oc_resource,
+                        )
+                    except ResourceKeyExistsError:
+                        # a user may have a Role assigned to them
+                        # from multiple app-interface roles
+                        pass
             for sa in service_accounts:
                 if ri is None:
                     continue
-                namespace, sa_name = sa.split('/')
-                oc_resource, resource_name = \
-                    construct_sa_oc_resource(
-                        permission['cluster_role'], namespace, sa_name)
+                namespace, sa_name = sa.split("/")
+                oc_resource, resource_name = construct_sa_oc_resource(
+                    permission["cluster_role"], namespace, sa_name
+                )
                 try:
                     ri.add_desired(
-                        permission['cluster'],
-                        namepsace,
-                        'ClusterRoleBinding',
+                        cluster,
+                        namespace_cluster_scope,
+                        "ClusterRoleBinding",
                         resource_name,
-                        oc_resource
+                        oc_resource,
                     )
                 except ResourceKeyExistsError:
                     # a ServiceAccount may have a Role assigned to it
@@ -160,20 +155,22 @@ def fetch_desired_state(ri, oc_map):
 
 
 @defer
-def run(dry_run, thread_pool_size=10, internal=None,
-        use_jump_host=True, defer=None):
-    clusters = [cluster_info for cluster_info
-                in queries.get_clusters()
-                if cluster_info.get('managedClusterRoles')]
+def run(dry_run, thread_pool_size=10, internal=None, use_jump_host=True, defer=None):
+    clusters = [
+        cluster_info
+        for cluster_info in queries.get_clusters()
+        if cluster_info.get("managedClusterRoles")
+    ]
     ri, oc_map = ob.fetch_current_state(
         clusters=clusters,
         thread_pool_size=thread_pool_size,
         integration=QONTRACT_INTEGRATION,
         integration_version=QONTRACT_INTEGRATION_VERSION,
-        override_managed_types=['ClusterRoleBinding'],
+        override_managed_types=["ClusterRoleBinding"],
         internal=internal,
-        use_jump_host=use_jump_host)
-    defer(lambda: oc_map.cleanup())
+        use_jump_host=use_jump_host,
+    )
+    defer(oc_map.cleanup)
     fetch_desired_state(ri, oc_map)
     ob.realize_data(dry_run, oc_map, ri, thread_pool_size)
 

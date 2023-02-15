@@ -6,8 +6,7 @@ metadata:
 objects:
 {{- range $i, $integration := .Values.integrations }}
 {{- $logs := $integration.logs | default dict -}}
-{{- $shards := int $integration.shards | default 1 }}
-{{- range $shard_id := until $shards }}
+{{- range $shard := $integration.shard_specs }}
 - apiVersion: apps/v1
   {{- if $integration.cache }}
   kind: StatefulSet
@@ -17,11 +16,11 @@ objects:
   metadata:
     labels:
       app: qontract-reconcile-{{ $integration.name }}
-    {{- if gt $shards 1 }}
-    name: qontract-reconcile-{{ $integration.name }}-{{ $shard_id }}
-    {{- else }}
-    name: qontract-reconcile-{{ $integration.name }}
-    {{- end }}
+    annotations:
+      ignore-check.kube-linter.io/minimum-three-replicas: "qontract-reconcile integrations are sharded and not replicated"
+      ignore-check.kube-linter.io/no-readiness-probe: "qontract-reconcile integrations are not getting traffic"
+      ignore-check.kube-linter.io/no-liveness-probe: "qontract-reconcile integrations are monitored for being stuck"
+    name: qontract-reconcile-{{ $integration.name }}{{ $shard.shard_name_suffix }}
   spec:
     {{- if $integration.cache }}
     volumeClaimTemplates:
@@ -34,6 +33,7 @@ objects:
           requests:
             storage: {{ default "1Gi" $integration.storage }}
     {{- end }}
+    revisionHistoryLimit: 50
     replicas: 1
     selector:
       matchLabels:
@@ -85,6 +85,31 @@ objects:
           - name: SLACK_ICON_EMOJI
             value: ${SLACK_ICON_EMOJI}
           {{- end }}
+          {{- if $logs.googleChat }}
+
+          {{- /*
+          "*-triggers" integrations will be sent to a seperate GChat channel as
+          they are much noisier than other integrations
+          */}}
+
+          {{- if $integration.trigger }}
+          - name: GOOGLE_CHAT_WEBHOOK_URL
+            valueFrom:
+              secretKeyRef:
+                key: google_chat.triggers_url
+                name: app-interface
+          {{- else }}
+          - name: GOOGLE_CHAT_WEBHOOK_URL
+            valueFrom:
+              secretKeyRef:
+                key: google_chat.webhook_url
+                name: app-interface
+          {{- end }}
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          {{- end }}
           - name: LOG_GROUP_NAME
             valueFrom:
               secretKeyRef:
@@ -98,6 +123,7 @@ objects:
             <source>
               @type tail
               path /fluentd/log/integration.log
+              read_from_head true
               pos_file /fluentd/log/integration.log.pos
               tag integration
               <parse>
@@ -138,6 +164,27 @@ objects:
                 message "\`\`\`[{{ $integration.name }}] %s\`\`\`"
               </store>
               {{- end }}
+              {{- if $logs.googleChat }}
+              <store>
+                @type teams
+                webhook_url "${GOOGLE_CHAT_WEBHOOK_URL}&threadKey=${POD_NAME}"
+                text "<%= Time.at(time) %> [${POD_NAME}] <%= record['message'] %>\n\n"
+                buffered true
+                <buffer>
+                  @type file
+                  path /fluentd/buffer
+
+                  flush_mode interval
+                  flush_interval 15s
+                  flush_at_shutdown true
+
+                  retry_max_times 5
+                  retry_wait 30
+
+                  disable_chunk_backup true
+                </buffer>
+              </store>
+              {{- end }}
               <store>
                 @type cloudwatch_logs
                 log_group_name ${LOG_GROUP_NAME}
@@ -151,21 +198,39 @@ objects:
             mountPath: /fluentd/etc/
         containers:
         - name: int
+          {{- if $shard.imageRef }}
+          image: ${IMAGE}:{{$shard.imageRef}}
+          {{- else if $integration.imageRef}}
+          image: ${IMAGE}:{{$integration.imageRef}}
+          {{- else }}
           image: ${IMAGE}:${IMAGE_TAG}
+          {{- end }}
           ports:
             - name: http
               containerPort: 9090
           env:
+          {{- if $shard.shard_id }}
           - name: SHARDS
-            value: "{{ $shards }}"
+            value: "{{ $shard.shards }}"
           - name: SHARD_ID
-            value: "{{ $shard_id }}"
+            value: "{{ $shard.shard_id }}"
+          {{- end }}
+          {{- if $shard.shard_key }}
+          - name: SHARD_KEY
+            value: "{{ $shard.shard_key }}"
+          {{- end }}
           - name: DRY_RUN
             value: ${DRY_RUN}
+          {{- if eq $integration.name "integrations-manager" }}
+          - name: MANAGER_DRY_RUN
+            value: ${MANAGER_DRY_RUN}
+          {{- end }}
           - name: INTEGRATION_NAME
             value: {{ $integration.name }}
+          {{- with $shard.extra_args }}
           - name: INTEGRATION_EXTRA_ARGS
-            value: "{{ $integration.extraArgs }}"
+            value: "{{ $shard.extra_args }}"
+          {{- end }}
           - name: SLEEP_DURATION_SECS
             {{- if $integration.sleepDurationSecs }}
             value: {{ "${" }}{{ $integration.name | upper | replace "-" "_" }}_SLEEP_DURATION_SECS{{ "}" }}
@@ -193,6 +258,7 @@ objects:
           - name: APP_INTERFACE_STATE_BUCKET_ACCOUNT
             value: "${APP_INTERFACE_STATE_BUCKET_ACCOUNT}"
           {{- end }}
+          {{- if not $integration.disableUnleash }}
           - name: UNLEASH_API_URL
             valueFrom:
               secretKeyRef:
@@ -203,19 +269,54 @@ objects:
               secretKeyRef:
                 name: unleash
                 key: CLIENT_ACCESS_TOKEN
+          {{- end }}
           - name: SLOW_OC_RECONCILE_THRESHOLD
             value: "${SLOW_OC_RECONCILE_THRESHOLD}"
           - name: LOG_SLOW_OC_RECONCILE
             value: "${LOG_SLOW_OC_RECONCILE}"
           - name: USE_NATIVE_CLIENT
             value: "${USE_NATIVE_CLIENT}"
+          {{- if $integration.environmentAware }}
+          - name: ENVIRONMENT_NAME
+            value: "${ENVIRONMENT_NAME}"
+          - name: IMAGE
+            value: "${IMAGE}"
+          - name: IMAGE_TAG
+            value: "${IMAGE_TAG}"
+          - name: BUSYBOX_IMAGE
+            value: "${BUSYBOX_IMAGE}"
+          - name: BUSYBOX_IMAGE_TAG
+            value: "${BUSYBOX_IMAGE_TAG}"
+          - name: BUSYBOX_IMAGE_PULL_POLICY
+            value: "${BUSYBOX_IMAGE_PULL_POLICY}"
+          - name: FLUENTD_IMAGE
+            value: "${FLUENTD_IMAGE}"
+          - name: FLUENTD_IMAGE_TAG
+            value: "${FLUENTD_IMAGE_TAG}"
+          - name: FLUENTD_IMAGE_PULL_POLICY
+            value: "${FLUENTD_IMAGE_PULL_POLICY}"
+          - name: CLOUDWATCH_SECRET
+            value: "${CLOUDWATCH_SECRET}"
+          - name: INTERNAL_CERTIFICATES_IMAGE
+            value: "${INTERNAL_CERTIFICATES_IMAGE}"
+          - name: INTERNAL_CERTIFICATES_IMAGE_TAG
+            value: "${INTERNAL_CERTIFICATES_IMAGE_TAG}"
+          - name: INTERNAL_CERTIFICATES_IMAGE_PULL_POLICY
+            value: "${INTERNAL_CERTIFICATES_IMAGE_PULL_POLICY}"
+          {{- end }}
           {{- with $integration.extraEnv }}
           {{- range $i, $env := . }}
+          {{- if $env.secretKey }}
           - name: {{ $env.secretKey }}
             valueFrom:
               secretKeyRef:
                 name: {{ $env.secretName }}
                 key: {{ $env.secretKey }}
+          {{- end }}
+          {{- if $env.name }}
+          - name: {{ $env.name }}
+            value: {{ $env.value }}
+          {{- end }}
           {{- end }}
           {{- end }}
           {{- if $integration.resources }}
@@ -271,6 +372,27 @@ objects:
               secretKeyRef:
                 name: ${CLOUDWATCH_SECRET}
                 key: aws_secret_access_key
+          {{- if $integration.fluentdResources }}
+          resources:
+            {{- if $integration.fluentdResources.limits }}
+            limits:
+              {{- if $integration.fluentdResources.limits.cpu }}
+              cpu: {{ "${" }}{{ $integration.name | upper | replace "-" "_" }}_FLUENTD_CPU_LIMIT{{ "}" }}
+              {{- end }}
+              {{- if $integration.fluentdResources.limits.memory }}
+              memory: {{ "${" }}{{ $integration.name | upper | replace "-" "_" }}_FLUENTD_MEMORY_LIMIT{{ "}" }}
+              {{- end }}
+            {{- end }}
+            {{- if $integration.fluentdResources.requests }}
+            requests:
+              {{- if $integration.fluentdResources.requests.cpu }}
+              cpu: {{ "${" }}{{ $integration.name | upper | replace "-" "_" }}_FLUENTD_CPU_REQUEST{{ "}" }}
+              {{- end }}
+              {{- if $integration.fluentdResources.requests.memory }}
+              memory: {{ "${" }}{{ $integration.name | upper | replace "-" "_" }}_FLUENTD_MEMORY_REQUEST{{ "}" }}
+              {{- end }}
+            {{- end }}
+          {{- else }}
           resources:
             requests:
               memory: 30Mi
@@ -278,11 +400,16 @@ objects:
             limits:
               memory: 120Mi
               cpu: 25m
+          {{- end }}
           volumeMounts:
           - name: logs
             mountPath: /fluentd/log/
           - name: fluentd-config
             mountPath: /fluentd/etc/
+          {{- if $logs.googleChat }}
+          - name: buffer
+            mountPath: /fluentd/buffer
+          {{- end }}
         volumes:
         - name: qontract-reconcile-toml
           secret:
@@ -291,6 +418,10 @@ objects:
           emptyDir: {}
         - name: fluentd-config
           emptyDir: {}
+        {{- if $logs.googleChat }}
+        - name: buffer
+          emptyDir: {}
+        {{- end }}
         {{- if $integration.internalCertificates }}
         - name: internal-certificates
           emptyDir: {}
@@ -298,21 +429,32 @@ objects:
 {{- end }}
 {{- end }}
 {{- range $i, $integration := .Values.cronjobs }}
-- apiVersion: batch/v1beta1
+- apiVersion: batch/v1
   kind: CronJob
   metadata:
     labels:
+      {{- if $integration.command }}
+        {{- if eq $integration.command "e2e-tests" }}
+      app: e2e-tests-{{ $integration.name }}
+    name: e2e-tests-{{ $integration.name }}
+        {{- else }}
+      app: qontract-reconcile-{{ $integration.name }}
+    name: qontract-reconcile-{{ $integration.name }} 
+        {{- end }}
+      {{- else }}
       app: qontract-reconcile-{{ $integration.name }}
     name: qontract-reconcile-{{ $integration.name }}
+      {{- end }}
   spec:
     schedule: "{{ $integration.cron }}"
     concurrencyPolicy: {{ $integration.concurrencyPolicy | default "Allow" }}
-    successfulJobHistoryLimit: {{ $integration.successfulJobHistoryLimit | default "3" }}
-    failedJobHistoryLimit: {{ $integration.failedJobHistoryLimit | default "1" }}
+    successfulJobsHistoryLimit: {{ if not (kindIs "invalid" $integration.successfulJobHistoryLimit) }}{{ $integration.successfulJobHistoryLimit }}{{ else }}{{ 3 }}{{ end }}
+    failedJobsHistoryLimit: {{ if not (kindIs "invalid" $integration.failedJobHistoryLimit) }}{{ $integration.failedJobHistoryLimit }}{{ else }}{{ 1 }}{{ end }}
     jobTemplate:
       spec:
         template:
           spec:
+            serviceAccountName: qontract-reconcile
             containers:
             - name: int
               image: ${IMAGE}:${IMAGE_TAG}
@@ -321,15 +463,22 @@ objects:
                 value: 'true'
               - name: DRY_RUN
                 value: ${DRY_RUN}
+              {{- if $integration.command }}
+              - name: COMMAND_NAME
+                value: {{ $integration.command }}
+              {{- end }}
               - name: INTEGRATION_NAME
                 value: {{ $integration.name }}
+              {{- with $integration.extraArgs }}
               - name: INTEGRATION_EXTRA_ARGS
                 value: "{{ $integration.extraArgs }}"
+              {{- end }}
               - name: GITHUB_API
                 valueFrom:
                   configMapKeyRef:
                     name: app-interface
                     key: GITHUB_API
+              {{- if not $integration.disableUnleash }}
               - name: UNLEASH_API_URL
                 valueFrom:
                   secretKeyRef:
@@ -340,13 +489,20 @@ objects:
                   secretKeyRef:
                     name: unleash
                     key: CLIENT_ACCESS_TOKEN
+              {{- end }}
               {{- with $integration.extraEnv }}
               {{- range $i, $env := . }}
+              {{- if $env.secretKey}}
               - name: {{ $env.secretKey }}
                 valueFrom:
                   secretKeyRef:
                     name: {{ $env.secretName }}
                     key: {{ $env.secretKey }}
+              {{- end }}
+              {{- if $env.name }}
+              - name: {{ $env.name }}
+                value: {{ $env.value }}
+              {{- end }}
               {{- end }}
               {{- end }}
               {{- if $integration.dashdotdb }}
@@ -386,6 +542,7 @@ objects:
               secret:
                 secretName: qontract-reconcile-toml
 {{- end }}
+{{- if not .Values.excludeService }}
 - apiVersion: v1
   kind: Service
   metadata:
@@ -400,6 +557,7 @@ objects:
         name: http
     selector:
       component: qontract-reconcile
+{{- end }}
 parameters:
 - name: IMAGE
   value: quay.io/app-sre/qontract-reconcile
@@ -417,7 +575,11 @@ parameters:
   value: latest
 - name: FLUENTD_IMAGE_PULL_POLICY
   value: Always
+- name: ENVIRONMENT_NAME
+  value: app-interface
 - name: DRY_RUN
+  value: --dry-run
+- name: MANAGER_DRY_RUN
   value: --dry-run
 - name: SLEEP_DURATION_SECS
   value: "300"
@@ -479,6 +641,28 @@ parameters:
 {{- if $integration.resources.requests.memory }}
 - name: {{ $integration.name | upper | replace "-" "_" }}_MEMORY_REQUEST
   value: {{ $integration.resources.requests.memory }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if $integration.fluentdResources }}
+{{- if $integration.fluentdResources.limits }}
+{{- if $integration.fluentdResources.limits.cpu }}
+- name: {{ $integration.name | upper | replace "-" "_"}}_FLUENTD_CPU_LIMIT
+  value: {{ $integration.fluentdResources.limits.cpu }}
+{{- end }}
+{{- if $integration.fluentdResources.limits.memory }}
+- name: {{ $integration.name | upper | replace "-" "_" }}_FLUENTD_MEMORY_LIMIT
+  value: {{ $integration.fluentdResources.limits.memory }}
+{{- end }}
+{{- end }}
+{{- if $integration.fluentdResources.requests }}
+{{- if $integration.fluentdResources.requests.cpu }}
+- name: {{ $integration.name | upper | replace "-" "_" }}_FLUENTD_CPU_REQUEST
+  value: {{ $integration.fluentdResources.requests.cpu }}
+{{- end }}
+{{- if $integration.fluentdResources.requests.memory }}
+- name: {{ $integration.name | upper | replace "-" "_" }}_FLUENTD_MEMORY_REQUEST
+  value: {{ $integration.fluentdResources.requests.memory }}
 {{- end }}
 {{- end }}
 {{- end }}

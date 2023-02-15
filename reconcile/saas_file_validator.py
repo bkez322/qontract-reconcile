@@ -1,17 +1,22 @@
+import logging
 import sys
 
-import reconcile.queries as queries
-
-from reconcile.utils.semver_helper import make_semver
+from reconcile import queries
+from reconcile.jenkins_job_builder import init_jjb
+from reconcile.status import ExitCodes
+from reconcile.utils.jjb_client import JJB
 from reconcile.utils.saasherder import SaasHerder
+from reconcile.utils.secret_reader import SecretReader
+from reconcile.utils.semver_helper import make_semver
 
-QONTRACT_INTEGRATION = 'saas-file-validator'
+QONTRACT_INTEGRATION = "saas-file-validator"
 QONTRACT_INTEGRATION_VERSION = make_semver(0, 1, 0)
 
 
 def run(dry_run):
-    saas_files = queries.get_saas_files(v1=True, v2=True)
+    saas_files = queries.get_saas_files()
     settings = queries.get_app_interface_settings()
+    secret_reader = SecretReader(settings)
     saasherder = SaasHerder(
         saas_files,
         thread_pool_size=1,
@@ -19,6 +24,13 @@ def run(dry_run):
         integration=QONTRACT_INTEGRATION,
         integration_version=QONTRACT_INTEGRATION_VERSION,
         settings=settings,
-        validate=True)
-    if not saasherder.valid:
-        sys.exit(1)
+        validate=True,
+    )
+    app_int_repos = queries.get_repos()
+    missing_repos = [r for r in saasherder.repo_urls if r not in app_int_repos]
+    for r in missing_repos:
+        logging.error(f"repo is missing from codeComponents: {r}")
+    jjb: JJB = init_jjb(secret_reader)
+    saasherder.validate_upstream_jobs(jjb)
+    if not saasherder.valid or missing_repos:
+        sys.exit(ExitCodes.ERROR)

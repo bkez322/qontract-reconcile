@@ -1,0 +1,9 @@
+{
+  "path": "saas2.yaml",
+  "name": "saas2",
+  "pipelinesProvider": {
+    "name": "provider2-with-resources",
+    "provider": "tekton"
+  },
+  "deployResources": null
+}

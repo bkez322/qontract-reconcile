@@ -30,6 +30,7 @@ The minimum methods that have to be defined are:
 * `title`: a property that is used to give the Gitlab Merge Request a title.
   It can also be used for building commit messages or as content to committed
   files.
+* `description`: a description for the Merge Request.
 * `process`: this method is called when submitting the Merge Request to gitlab.
   it's the place for the merge request changes, like creating, updating and
   deleting files. The `process` method is called after the local branch is
@@ -58,8 +59,12 @@ class CreateDeleteUser(MergeRequestBase):
         super().__init__()
 
     @property
-    def title(self):
+    def title(self) -> str:
         return f'[{self.name}] delete user {self.username}'
+
+    @property
+    def description(self) -> str:
+        return f'delete user {self.username}'
 
     def process(self, gitlab_cli):
         for path in self.paths:
@@ -89,14 +94,15 @@ merge_request = CreateAppInterfaceNotificator(notification=notification)
 then create the SQS Client instance:
 
 ```python
-import reconcile.queries as queries
+from reconcile import queries
 
 from reconcile.utils.sqs_gateway import SQSGateway
+from reconcile.utils.secret_reader import SecretReader
 
 
-accounts = queries.get_aws_accounts()
-settings = queries.get_app_interface_settings()
-sqs_cli = SQSGateway(accounts, settings=settings)
+accounts = queries.get_queue_aws_accounts()
+secretReader = SecretReader(queries.get_secret_reader_settings())
+sqs_cli = SQSGateway(accounts, secret_reader=secret_reader)
 ```
 
 and then submit the merge request to the SQS:
@@ -112,15 +118,17 @@ first get the SQS messages:
 
 
 ```python
-import reconcile.queries as queries
+from reconcile import queries
 
 from reconcile.utils.sqs_gateway import SQSGateway
+from reconcile.utils.secret_reader import SecretReader
 
 
-accounts = queries.get_aws_accounts()
+accounts = queries.get_queue_aws_accounts()
 settings = queries.get_app_interface_settings()
 
-sqs_cli = SQSGateway(accounts, settings=settings)
+secretReader = SecretReader(queries.get_secret_reader_settings())
+sqs_cli = SQSGateway(accounts, secret_reader=secret_reader)
 messages = sqs_cli.receive_messages()
 ```
 
@@ -132,7 +140,7 @@ from reconcile.utils.gitlab_api import GitLabApi
 instance = queries.get_gitlab_instance()
 saas_files = queries.get_saas_files_minimal()
 gitlab_cli = GitLabApi(instance, project_id=gitlab_project_id,
-                       settings=settings, saas_files=saas_files)
+                       settings=settings)
 ```
 
 and then loop the messages, creating the MergeRequest objects and submitting
